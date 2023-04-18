@@ -1,102 +1,75 @@
 // attempt to use cracker with the gpg plugin to crack open the test file
 
 #include <string>
+#include <vector>
 #include <cstdlib>
 #include <unistd.h>
+#include <stdlib.h>
 #include <fcntl.h> // for O_CLOEXEC
+#include <boost/process.hpp>
+#include <iostream>
+#include <algorithm> // for copy
 
-
-#include "logging.hh"
+#include "../logging.hh"
 
 using namespace std;
+namespace bp = boost::process;
 
 #define ASSERT_NOT(x, y) { if (x == y) ABORT(x) }
 #define ASSERT_IS(x, y) { if (x != y) ABORT(x << " != " << y) }
 
-enum PIPE_FILE_DESCRIPTERS
-{
-  READ_FD  = 0,
-  WRITE_FD = 1
-};
-
-typedef struct _ChildDescriptor {
-    int read_fd;
-    int write_fd;
-    pid_t pid;
-    int err_no;
-} ChildDescriptor;
+// foo is the real pwd; off by one to see if it can crack it!
+#define SEED_PWD "foo"
+// set distance to one when it's time to crack it
+#define DISTANCE "0"
 
 const char *CRACKER_CMD = "cracker";
-const char *PLUGIN_CMD[] = {
-    CRACKER_CMD,
+vector<string> plugin_args = {
     "--checker",
     "./data/encrypted.txt.gpg",
+    "--distance",
+    DISTANCE,
     "--plugin",
-    "libcrackerplugin_gpg.so.1.0.0",
-    NULL
+    "../libcrackerplugin_gpg.so.1.0.0"
 };
 
-inline std::ostream& operator<<(std::ostream& os, char** str) {
-    // Output each string in the array, separated by commas
+inline std::ostream& operator <<(std::ostream& os, char * const *str) {
     for (int i = 0; str[i] != nullptr; ++i) {
         os << str[i];
         if (str[i + 1] != nullptr) {
             os << ", ";
         }
     }
+    return os;    
+}
+
+/* Output each string in the array, separated by commas */
+inline std::ostream& operator<<(std::ostream& os, char** str) {
+    return os << const_cast<char * const *>(str);
+}
+
+/* Copy input stream to output stream */
+std::ostream & operator<<(std::ostream& os, std::istream& is) {
+    is >> std::noskipws;
+
+    copy(std::istream_iterator<char>(is), 
+              std::istream_iterator<char>(), 
+              std::ostream_iterator<char>(os));
     return os;
 }
 
-// Executes the given command and returns descriptor that can be used to interact with it.
-// Stdout and stderr are collected in the same file descriptor.
-// @param commandAndArgs should have a null pointer to indicate no more args
-// @param sendData should be true if a second pipe is needed to write to STDIN on the subprocess
-// Make sure to read and write from/to the file descriptors at the right times to avoid deadlocking, else use
-//   non-blocking calls (select?)
-// Make sure to close the file descriptors when done with them so the pipes behave correctly.
-// Make sure to free the descriptor object when done with it to avoid memory leak.
-ChildDescriptor *execute(char * const *commandAndArgs, bool sendData) {
-    ChildDescriptor *ret = (ChildDescriptor *)malloc(sizeof(ChildDescriptor));
-    ASSERT_NOT(nullptr, ret);
-    int parentToChild[2]; // parent writes to [1], child reads from [0]
-    int childToParent[2]; // child writes to [1], parent reads from [0]
-    int execCheck[2]; // pipe descriptors to be auto-closed on successful exec, get error otherwise
-
-    if (sendData)
-        ASSERT_IS(0, pipe(parentToChild));
-    ASSERT_IS(0, pipe(childToParent));
-    ASSERT_IS(0, pipe(execCheck));
-    ASSERT_NOT(-1, fcntl(execCheck[0], F_SETFD, FD_CLOEXEC));
-    ASSERT_NOT(-1, fcntl(execCheck[1], F_SETFD, FD_CLOEXEC));
-
-    ret->read_fd = childToParent[READ_FD];
-    ret->write_fd = sendData ? parentToChild[WRITE_FD] : -1;
-    ret->err_no = 0;
-
-    switch (ret->pid = fork()) {
-        case -1: ABORT("failed to fork")
-        case 0: // child
-            if (sendData)
-                ASSERT_IS(0, close(parentToChild [WRITE_FD]));
-            ASSERT_IS(0, close(childToParent [READ_FD]));
-            ASSERT_IS(0, close(execCheck[READ_FD]));
-            if (sendData)
-                ASSERT_NOT(-1, dup2(parentToChild[READ_FD], STDIN_FILENO));
-            ASSERT_NOT(-1, dup2(childToParent[WRITE_FD], STDOUT_FILENO));
-            ASSERT_NOT(-1, dup2(childToParent[WRITE_FD], STDERR_FILENO));
-            execv(commandAndArgs[0], commandAndArgs);
-            write(execCheck[WRITE_FD], &errno, sizeof(errno)); // let parent know what error
-            ABORT("failed to exec")
-        default: // parent
-            if (sendData)
-                ASSERT_IS(0, close(parentToChild [READ_FD]));
-            ASSERT_IS(0, close(childToParent [WRITE_FD]));
-            ASSERT_IS(0, close(execCheck[WRITE_FD]));
-            read(execCheck[READ_FD], &ret->err_no, sizeof(ret->err_no));
-            ASSERT_IS(0, close(execCheck[READ_FD]));
+/* output vector to stream */
+template <typename T>
+std::ostream & operator<<(std::ostream & os, std::vector<T>& v) {
+    os << '[';
+    typename vector<T>::const_iterator vit = v.cbegin();
+    if (vit < v.cend()) os << *vit;
+    while (++vit < v.cend()) {
+        os << ", " << *vit;
     }
+    os << ']';
 
-    return ret;
+    return os;
 }
 
 bool is_executable_in_path(const string &executable_name) {
@@ -126,23 +99,33 @@ bool is_executable_in_path(const string &executable_name) {
 }
 
 int main(int argc, const char **argv) {
-    char **plugin_cmd = static_cast<char **>(calloc(sizeof(PLUGIN_CMD), sizeof(const char *)));
-    char **i = plugin_cmd;
-    const char **j = PLUGIN_CMD;
-    for (; *j; i++, j++) {
-        *i = strdup(*j);
+    if (!is_executable_in_path(CRACKER_CMD)) {
+        ERR(CRACKER_CMD << " not in path, " << getenv("PATH"));
+        return -2;
     }
-    ChildDescriptor *cd = execute(plugin_cmd, false /* sendDat */);
 
-    if (cd->err_no) {
-        ERR("Non-zero return code " << cd->err_no << " when executing " << plugin_cmd);
+    setenv("SEED_PWD", SEED_PWD, 1 /* overwrite */);
+
+    bp::ipstream err_stream;
+    try {
+        bp::child c(bp::search_path(CRACKER_CMD), plugin_args, bp::std_err > err_stream);
+
+        c.wait();
+
+        if (c.exit_code() == 0)
+        {
+            INFO("Test passed!");
+        }
+        else
+        {
+            INFO("Command failed with exit code " << c.exit_code());
+            INFO("Error output: " << err_stream);
+        }
+    } catch (const bp::process_error& e)
+    {
+        ERR("Error executing command: " << e.what() << "; command was: " << CRACKER_CMD << " " << plugin_args);
         return -1;
     }
-
-    close(cd->read_fd);
-    free(cd);
-    for (i = plugin_cmd; *i; i++)
-        free(*i);
 
     return 0;
 }
